@@ -108,3 +108,29 @@ Nonlinear Dynamics and Chaos | Strogatz
 3. Sort by: author_match > title_match > format > downloads > size
 4. Navigate to slow_download → pass DDoS-Guard → inject JS → wait for Get button
 5. Download with retry/resume → fix extension via magic bytes → rename to title
+
+## Important: Download Process Timing
+
+**The download process is intentionally slow and requires patience:**
+
+- **DDoS-Guard bypass**: 5-30 seconds
+- **Slow channel countdown**: 60+ seconds to obtain download link (this is normal!)
+- **File download**: Depends on file size (can take minutes for large books)
+
+**DO NOT interrupt or restart the download during the waiting period.** The process includes:
+- Built-in logging that shows progress every 5MB
+- Automatic retry on connection failures (up to 5 attempts)
+- Resume support for interrupted downloads
+
+When you see logs like:
+```
+[20s] ['[Fetching...]', '[Queued]', '[Wait: 45s]']
+[40s] ['[Wait: 25s]', '[Queued]']
+```
+
+This is **expected behavior** - the JS injection is working and countdowns are progressing. Wait for the final `[OK]` log message indicating successful download and rename.
+
+**Only consider the download failed if:**
+- You see `[FAIL]` in the logs
+- The process exits with an error
+- After waiting 2+ minutes with no progress logs
