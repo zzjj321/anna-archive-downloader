@@ -1,50 +1,57 @@
-# Anna's Archive Book Downloader
+# Anna's Archive 书籍下载器
 
-Automated book downloader for [Anna's Archive](https://annas-archive.pk) via the slow channel. Bypasses DDoS-Guard, countdown timers, and handles resume/retry automatically.
+自动化下载 [Anna's Archive](https://annas-archive.pk) 慢通道书籍。自动绕开 DDoS-Guard 人机验证、倒计时等待，支持断点续传和批量下载。
 
-## Features
+## 功能特性
 
-- **DDoS-Guard bypass** - Automatic verification handling
-- **Slow channel automation** - JS injection bypasses countdown timers
-- **Smart filtering** - Excludes solutions manuals, matches author/title
-- **Format priority** - PDF > EPUB > DjVu > MOBI
-- **Resume download** - HTTP Range headers for interrupted downloads
-- **Magic-byte detection** - Corrects wrong file extensions automatically
-- **Batch download** - Process entire book lists with retry queue
-- **Skip detection** - Checks existing files to avoid re-downloads
+- **DDoS-Guard 自动绕过** — 自动完成验证流程
+- **慢通道自动化** — 注入 JS 绕过倒计时，直接拿到下载链接
+- **智能筛选** — 排除 solutions manual，按作者 / 书名匹配度排序
+- **格式优先级** — PDF > EPUB > DjVu > MOBI
+- **断点续传** — 网络中断后用 HTTP Range 继续
+- **Magic-byte 扩展名校验** — 自动修正错标的文件后缀
+- **批量下载** — 从书单文件一次下载多本，失败自动重入队列
+- **去重** — 已存在的文件自动跳过
+- **自动重命名** — `md5.ext` → `书名 - 作者.ext`
 
-## Installation
+## 安装
 
 ```bash
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-Or install as a package:
+或者以包形式安装（会注册 `anna-download` 命令）：
 
 ```bash
 pip install -e .
 ```
 
-## Quick Start
+## 快速开始
 
-### 1. Launch Chrome with CDP debugging
+### 1. 启动带 CDP 调试端口的 Chrome
 
 ```bash
 anna-download --launch
-# Or manually:
-# chrome --remote-debugging-port=9223 --user-data-dir=~/.anna-downloader/chrome-profile
 ```
 
-### 2. Download a single book
+或手动启动：
+
+```bash
+chrome --remote-debugging-port=9223 --user-data-dir=~/.anna-downloader/chrome-profile
+```
+
+> 首次启动时若遇到 DDoS-Guard，请在弹出的浏览器窗口中手动完成一次验证，cookie 会被保存到 `chrome-profile`，后续请求即可免验证。
+
+### 2. 下载单本书
 
 ```bash
 anna-download -q "Classical Mechanics Taylor"
 ```
 
-### 3. Batch download from book list
+### 3. 批量下载
 
-Create a book list file (`booklist.txt`):
+创建书单文件 `booklist.txt`（分隔符支持 `|`、Tab、逗号）：
 
 ```
 Classical Mechanics | J.R. Taylor
@@ -52,24 +59,36 @@ Mechanics | Landau Lifshitz
 Nonlinear Dynamics and Chaos | Strogatz
 ```
 
-Run batch download:
+执行批量下载：
 
 ```bash
 anna-download --batch booklist.txt --prefer pdf --dir ./my_books
 ```
 
+## 命令行参数
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `--launch` | 启动带 CDP 的 Chrome | — |
+| `--port PORT` | CDP 端口 | `9223` |
+| `-q, --query QUERY` | 单本书搜索词（建议"书名 + 作者"） | — |
+| `--batch BATCH` | 书单文件路径 | — |
+| `--dir DIR` | 下载目录 | `./downloads` |
+| `--prefer {pdf,epub,djvu,mobi}` | 首选格式 | — |
+| `-n, --count N` | 下载数量（配合 `-q`） | `1` |
+
 ## Python API
+
+### 单本下载
 
 ```python
 from anna_downloader import connect_cdp, get_page, search_books, download_book
 from pathlib import Path
 
-# Connect to Chrome
 pw, browser = connect_cdp()
 context = browser.contexts[0] if browser.contexts else browser.new_context()
 page = get_page(context)
 
-# Search and download
 books = search_books(page, "Classical Mechanics Taylor", max_results=10)
 if books:
     download_book(page, context, books[0], download_dir=Path("./downloads"))
@@ -78,7 +97,7 @@ browser.close()
 pw.stop()
 ```
 
-### Batch download API
+### 批量下载
 
 ```python
 from anna_downloader import connect_cdp, get_page, BatchDownloader, parse_book_list
@@ -88,10 +107,7 @@ pw, browser = connect_cdp()
 context = browser.contexts[0] if browser.contexts else browser.new_context()
 page = get_page(context)
 
-# Parse book list
 books = parse_book_list("booklist.txt")
-
-# Run batch download
 batch = BatchDownloader(page, context, download_dir="./downloads", prefer_fmt="pdf")
 report, failed = batch.run(books)
 batch.save_report()
@@ -100,54 +116,48 @@ browser.close()
 pw.stop()
 ```
 
-## Book List Format
+## 工作流程
 
-One book per line. Supported separators: `|`, tab, or comma.
+1. **搜索** — 用 `书名 + 作者` 在 Anna's Archive 查询
+2. **过滤** — 剔除 solutions manual，要求作者词命中
+3. **排序** — 按 `author_match > title_match > format > downloads > size` 选最优
+4. **DDoS-Guard** — 导航到 `slow_download` 页面，等待（或手动完成）验证
+5. **JS 注入** — 注入脚本绕过倒计时，提取直链
+6. **下载** — 带重试 / 断点续传，用 magic bytes 校验扩展名
+7. **重命名** — `md5.ext` → `书名 - 作者.ext`
 
-```
-Title | Author
-Another Title | Another Author
-```
-
-## Claude Code Skill
-
-This package includes a Claude Code Skill definition at `.claude/skills/anna-download.md`. Once installed, Claude Code can use this skill to help you download books:
-
-```
-/anna-download booklist.txt --prefer pdf
-```
-
-## How It Works
-
-1. **Search** - Query Anna's Archive with `title + author`
-2. **Filter** - Remove solutions manuals, require author match
-3. **Sort** - By author_match > title_match > format > downloads > size
-4. **DDoS-Guard** - Navigate to slow_download, wait for verification
-5. **JS injection** - Bypass countdown timer, extract direct download URL
-6. **Download** - With retry/resume, fix extensions via magic bytes
-7. **Rename** - `md5.ext` → `Title - Author.ext`
-
-## Project Structure
+## 项目结构
 
 ```
 anna-archive-downloader/
 ├── anna_downloader/
-│   ├── __init__.py         # Package exports
-│   ├── chrome.py           # Chrome CDP launch/connect
-│   ├── downloader.py       # Core download engine
-│   ├── batch.py            # Batch scheduler
-│   ├── cli.py              # CLI entry point
-│   └── inspect.js          # JS extraction script
+│   ├── __init__.py         # 包导出
+│   ├── chrome.py           # Chrome CDP 启动 / 连接
+│   ├── downloader.py       # 核心下载引擎
+│   ├── batch.py            # 批量调度器
+│   ├── cli.py              # CLI 入口
+│   └── inspect.js          # 搜索结果结构化提取脚本
 ├── examples/
 │   └── classical_mechanics.txt
-├── .claude/
-│   └── skills/
-│       └── anna-download.md
 ├── requirements.txt
 ├── pyproject.toml
 └── README.md
 ```
 
-## License
+## 常见问题
+
+**Q: 总是弹出 DDoS-Guard 验证？**
+A: 用 `--launch` 启动 Chrome 后，在弹出的浏览器窗口中手动完成一次验证，cookie 会保存到 `~/.anna-downloader/chrome-profile`，后续请求可免验证。不要每次都用新的 profile。
+
+**Q: 下载速度很慢？**
+A: 慢通道本身限速，属正常现象。脚本默认带断点续传，中断后再跑一次会继续下载。
+
+**Q: 搜索结果里出现 solutions manual？**
+A: 已内置过滤，但如果关键词本身包含 "solution"，可能误伤。建议关键词只写 "书名 + 作者"。
+
+**Q: Anna's Archive 镜像切换导致失败？**
+A: 当前 BASE_URL 写死为 `annas-archive.pk`。如遇持续不可用，可在 `anna_downloader/downloader.py` 顶部改为其他镜像（如 `.is` / `.se`）。
+
+## 许可证
 
 MIT
