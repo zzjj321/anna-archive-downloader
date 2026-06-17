@@ -162,38 +162,14 @@ def get_page(context):
 # ---------- Search ----------
 
 def search_books(page, keyword, max_results=30):
-    """Search Anna's Archive, return [{title, md5}]."""
-    search_url = f"{BASE_URL}/search?q={quote_plus(keyword)}"
-    log.info(f"search: {search_url}")
+    """Search Anna's Archive, return [{title, md5}] ranked by keyword relevance.
 
-    page.goto(search_url, timeout=60000)
-    page.wait_for_load_state("domcontentloaded")
-    time.sleep(random.uniform(3, 5))
-
-    books = []
-    seen_md5 = set()
-
-    results = page.evaluate("""() => {
-        return Array.from(document.querySelectorAll('a[href*="/md5/"]')).map(a => ({
-            href: a.getAttribute('href') || '',
-            text: (a.innerText || '').trim().substring(0, 150)
-        })).filter(x => x.href.match(/\/md5\/[a-f0-9]{32}/) && x.text.length > 2);
-    }""")
-
-    for r in results:
-        m = re.search(r"/md5/([a-f0-9]{32})", r["href"])
-        if not m:
-            continue
-        md5 = m.group(1)
-        if md5 in seen_md5:
-            continue
-        seen_md5.add(md5)
-        books.append({"title": r["text"], "md5": md5})
-        if len(books) >= max_results:
-            break
-
-    log.info(f"found {len(books)} results")
-    return books
+    Delegates to search_books_detailed for structured extraction, then strips
+    extra fields. Avoids the original naive a[href*="/md5/"] scrape which
+    pulled sidebar/recommendation links with bogus titles.
+    """
+    detailed = search_books_detailed(page, keyword, max_results=max_results)
+    return [{"title": b.get("title", ""), "md5": b["md5"]} for b in detailed]
 
 
 def search_books_detailed(page, query, max_results=30):
@@ -201,8 +177,7 @@ def search_books_detailed(page, query, max_results=30):
     search_url = f"{BASE_URL}/search?q={quote_plus(query)}"
     log.info(f"search: {search_url}")
 
-    page.goto(search_url, timeout=60000)
-    page.wait_for_load_state("domcontentloaded")
+    page.goto(search_url, timeout=60000, wait_until="domcontentloaded")
     time.sleep(random.uniform(3, 5))
 
     results = page.evaluate(INSPECT_JS)
@@ -245,7 +220,49 @@ def search_books_detailed(page, query, max_results=30):
             break
 
     log.info(f"found {len(books)} results")
-    return books
+    return _keyword_rank_detailed(books, query)
+
+
+def _keyword_rank_detailed(books, query):
+    """Rank detailed books by keyword overlap with title+author."""
+    stop = {"the", "a", "an", "of", "to", "in", "for", "and", "with", "by"}
+    keywords = [k.lower() for k in query.split() if len(k) > 2 and k.lower() not in stop]
+    if not keywords:
+        return books
+
+    def score(book):
+        title = (book.get("title") or "").lower()
+        author = (book.get("author") or "").lower()
+        s = sum(10 for kw in keywords if kw in title)
+        s += sum(20 for kw in keywords if kw in author)
+        if "solution" in title:
+            s -= 1000
+        fmt = (book.get("fmt") or "").lower()
+        s += {"pdf": 4, "epub": 3, "djvu": 2, "mobi": 1}.get(fmt, 0)
+        return s
+
+    return sorted(books, key=score, reverse=True)
+
+
+def find_best_book(page, query, max_results=30):
+    """Search and return the single best matching book.
+
+    Uses detailed search + batch filter/pick logic:
+      - excludes solutions manuals / instructor editions
+      - requires author-word match + partial title match
+      - sorts by: author_match > title_match > format > downloads > size
+
+    Returns book dict (md5, title, author, fmt, ...) or None.
+    """
+    from .batch import filter_results, pick_best
+
+    results = search_books_detailed(page, query, max_results=max_results)
+    if not results:
+        return None
+
+    filtered = filter_results(results, author_query=query, book_title=query)
+    pool = filtered if filtered else results
+    return pick_best(pool)
 
 
 # ---------- DDoS-Guard ----------

@@ -35,20 +35,27 @@ When user asks to download books from Anna's Archive:
 
 ### Quick single book
 ```python
-from anna_downloader import connect_cdp, get_page, search_books, download_book
+from anna_downloader import connect_cdp, get_page, find_best_book, download_book
 from pathlib import Path
 
 pw, browser = connect_cdp()
 context = browser.contexts[0] if browser.contexts else browser.new_context()
 page = get_page(context)
 
-books = search_books(page, "Classical Mechanics Taylor", max_results=10)
-if books:
-    download_book(page, context, books[0], download_dir=Path("./downloads"))
+book = find_best_book(page, "Classical Mechanics Taylor")
+if book:
+    download_book(page, context, book, download_dir=Path("./downloads"))
+else:
+    print("No matching book found")
 
 browser.close()
 pw.stop()
 ```
+
+`find_best_book` searches with detailed extraction and applies filtering
+(excludes solutions manuals, requires author+title word match) then ranks by
+author_match > title_match > format > downloads > size. It returns the single
+best match — safer than grabbing `search_books(...)[0]`.
 
 ### Batch download from book list
 ```python
