@@ -1,0 +1,30 @@
+# downloads
+downloads/
+*.pdf
+*.epub
+*.mobi
+*.djvu
+*.zip
+
+# chrome profile
+chrome-profile/
+.anna-downloader/
+
+# logs
+*.log
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# os
+.DS_Store
+Thumbs.db
+
+# ide
+.vscode/
+.idea/
