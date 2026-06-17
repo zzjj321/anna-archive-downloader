@@ -430,15 +430,30 @@ def _do_download(context, direct_url, md5, download_dir, book_title="", author="
                 existing_size = 0
 
             total = existing_size
-            last_report = (total // (5*1024*1024)) * (5*1024*1024)
+            content_length_header = int(resp.headers.get("content-length", 0))
+            total_expected = (existing_size + content_length_header
+                              if resp.status_code == 206 else content_length_header)
+            start_time = time.time()
+            last_report_time = start_time
+            downloaded_this_attempt = 0
+
             with open(file_path, mode) as f:
                 for chunk in resp.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
                         total += len(chunk)
-                        if total - last_report > 5*1024*1024:
-                            log.info(f"    ... {total/(1024*1024):.0f} MB")
-                            last_report = total
+                        downloaded_this_attempt += len(chunk)
+                        now = time.time()
+                        if now - last_report_time >= 30:
+                            elapsed = now - start_time
+                            speed = downloaded_this_attempt / elapsed / 1024 if elapsed > 0 else 0
+                            if total_expected:
+                                pct = total / total_expected * 100
+                                log.info(f"    ... {total/(1024*1024):.1f}/{total_expected/(1024*1024):.1f} MB "
+                                         f"({pct:.0f}%) @ {speed:.1f} KB/s")
+                            else:
+                                log.info(f"    ... {total/(1024*1024):.1f} MB @ {speed:.1f} KB/s")
+                            last_report_time = now
 
             size_mb = total / (1024*1024)
             if size_mb < 0.01:
@@ -511,7 +526,8 @@ def rename_to_title(download_dir, md5, book_title, author):
     for ext in VALID_EXTS:
         src = download_dir / f"{md5}{ext}"
         if src.exists():
-            safe_name = re.sub(r'[<>:"/\\|?*]', "_", f"{book_title} - {author}")
+            display = f"{book_title} - {author}".strip(" -") if author else book_title
+            safe_name = re.sub(r'[<>:"/\\|?*]', "_", display)
             dst = download_dir / f"{safe_name}{ext}"
             if dst.exists() and dst != src:
                 dst = download_dir / f"{safe_name}_{md5[:8]}{ext}"
