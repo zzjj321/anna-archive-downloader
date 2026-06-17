@@ -17,6 +17,7 @@ urllib3.disable_warnings()
 log = logging.getLogger("anna_downloader")
 
 BASE_URL = "https://annas-archive.pk"
+VALID_EXTS = {".pdf", ".djvu", ".epub", ".mobi", ".zip", ".rar"}
 
 # JS injection for slow-channel countdown bypass
 INJECT_JS = r"""
@@ -367,10 +368,11 @@ def download_book(page, context, book, download_dir=None):
         log.error("  no download link obtained")
         return False
 
-    return _do_download(context, direct_url, md5, download_dir)
+    author = book.get("author", "")
+    return _do_download(context, direct_url, md5, download_dir, title, author)
 
 
-def _do_download(context, direct_url, md5, download_dir):
+def _do_download(context, direct_url, md5, download_dir, book_title="", author=""):
     """Download file with retry and resume support."""
     log.info(f"  downloading: {direct_url[:100]}...")
 
@@ -446,6 +448,11 @@ def _do_download(context, direct_url, md5, download_dir):
 
             file_path = _fix_extension(file_path)
 
+            if book_title:
+                renamed_path = rename_to_title(download_dir, md5, book_title, author)
+                if renamed_path:
+                    file_path = renamed_path
+
             log.info(f"  [OK] {file_path.name} ({size_mb:.1f} MB)")
             return True
 
@@ -484,8 +491,6 @@ def _fix_extension(file_path):
             detected_ext = ".mobi"
         else:
             detected_ext = ".zip"
-    elif len(header) > 67 and header[60:68] == b"BOOKMOBI":
-        detected_ext = ".mobi"
 
     if not detected_ext:
         return file_path
@@ -498,3 +503,20 @@ def _fix_extension(file_path):
     log.info(f"  format fix: {file_path.suffix} -> {detected_ext}")
     file_path.rename(new_path)
     return new_path
+
+
+def rename_to_title(download_dir, md5, book_title, author):
+    """Rename md5.ext to 'Book Title - Author.ext'."""
+    download_dir = Path(download_dir)
+    for ext in VALID_EXTS:
+        src = download_dir / f"{md5}{ext}"
+        if src.exists():
+            safe_name = re.sub(r'[<>:"/\\|?*]', "_", f"{book_title} - {author}")
+            dst = download_dir / f"{safe_name}{ext}"
+            if dst.exists() and dst != src:
+                dst = download_dir / f"{safe_name}_{md5[:8]}{ext}"
+            if src != dst:
+                src.rename(dst)
+                log.info(f"  renamed: {src.name} -> {dst.name}")
+            return dst
+    return None

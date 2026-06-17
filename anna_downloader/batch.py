@@ -6,12 +6,11 @@ import time
 import random
 from pathlib import Path
 
-from .downloader import search_books_detailed, download_book, BASE_URL
+from .downloader import search_books_detailed, download_book, BASE_URL, rename_to_title, VALID_EXTS
 
 log = logging.getLogger("anna_downloader")
 
 FORMAT_PRIORITY = {"pdf": 4, "epub": 3, "djvu": 2, "mobi": 1, "azw3": 1}
-VALID_EXTS = {".pdf", ".djvu", ".epub", ".mobi", ".zip", ".rar"}
 
 
 def parse_book_list(filepath):
@@ -115,23 +114,6 @@ def is_already_downloaded(download_dir, book_title, author, prefer_fmt=None):
                 log.info(f"  existing {f.name} is {f.suffix}, prefer .{prefer_fmt} -> re-download")
                 continue
             return f
-    return None
-
-
-def rename_to_title(download_dir, md5, book_title, author):
-    """Rename md5.ext to 'Book Title - Author.ext'."""
-    download_dir = Path(download_dir)
-    for ext in VALID_EXTS:
-        src = download_dir / f"{md5}{ext}"
-        if src.exists():
-            safe_name = re.sub(r'[<>:"/\\|?*]', "_", f"{book_title} - {author}")
-            dst = download_dir / f"{safe_name}{ext}"
-            if dst.exists() and dst != src:
-                dst = download_dir / f"{safe_name}_{md5[:8]}{ext}"
-            if src != dst:
-                src.rename(dst)
-                log.info(f"  renamed: {src.name} -> {dst.name}")
-            return dst
     return None
 
 
