@@ -498,6 +498,51 @@ def _do_download(context, direct_url, md5, download_dir, book_title="", author="
 
 PROBE_SECONDS = 5
 
+# Per-server health tracking (in-memory, process lifetime).
+# Keyed by download URL host (e.g. "93.123.118.11:6060") so stats survive
+# across different books even though the exact URLs differ.
+_SERVER_STATS = {}  # host -> {"successes": int, "consecutive_failures": int, "bytes": int}
+_SKIP_THRESHOLD = 3  # skip server after this many consecutive failures
+
+
+def _host_of(url):
+    """Extract 'host:port' from a URL for stable stats keying."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        return p.netloc or url
+    except Exception:
+        return url
+
+
+def _record_server(url, bytes_downloaded, success):
+    host = _host_of(url)
+    entry = _SERVER_STATS.setdefault(host, {"successes": 0, "consecutive_failures": 0, "bytes": 0})
+    if success and bytes_downloaded >= 10000:
+        entry["successes"] += 1
+        entry["consecutive_failures"] = 0
+        entry["bytes"] += bytes_downloaded
+    else:
+        entry["consecutive_failures"] += 1
+
+
+def _should_skip(url):
+    host = _host_of(url)
+    entry = _SERVER_STATS.get(host)
+    if not entry:
+        return False
+    return entry["consecutive_failures"] >= _SKIP_THRESHOLD
+
+
+def _format_stats():
+    if not _SERVER_STATS:
+        return ""
+    parts = []
+    for host, e in _SERVER_STATS.items():
+        parts.append(f"{host}: {e['successes']}ok/{e['consecutive_failures']}fail "
+                     f"({e['bytes'] // 1024}KB)")
+    return " | ".join(parts)
+
 
 def _do_download_parallel(context, urls, md5, download_dir, book_title="", author="",
                           probe_seconds=PROBE_SECONDS):
@@ -511,6 +556,8 @@ def _do_download_parallel(context, urls, md5, download_dir, book_title="", autho
          otherwise resume via _do_download.
     """
     log.info(f"  racing {len(urls)} servers ({probe_seconds}s probe)...")
+    if _SERVER_STATS:
+        log.info(f"  server health: {_format_stats()}")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -558,12 +605,39 @@ def _do_download_parallel(context, urls, md5, download_dir, book_title="", autho
             result_holder["size"] = size
 
     threads = []
+    skipped = []
+    active_indices = []
     for i, url in enumerate(urls):
+        if _should_skip(url):
+            skipped.append(i)
+            results[i]["status"] = "skipped"
+            results[i]["size"] = 0
+            continue
+        active_indices.append(i)
         t = threading.Thread(target=worker,
                              args=(i, url, tmp_paths[i], cancel_events[i], results[i]),
                              daemon=True)
         t.start()
         threads.append(t)
+
+    if skipped:
+        log.info(f"  skipping servers {skipped} (consecutive failures >= {_SKIP_THRESHOLD})")
+
+    # If all were skipped, reset and try again (stats may be stale)
+    if not active_indices:
+        log.warning(f"  all servers skipped; resetting stats and retrying all")
+        for url in urls:
+            host = _host_of(url)
+            if host in _SERVER_STATS:
+                _SERVER_STATS[host]["consecutive_failures"] = 0
+        for i, url in enumerate(urls):
+            results[i] = {}
+            t = threading.Thread(target=worker,
+                                 args=(i, url, tmp_paths[i], cancel_events[i], results[i]),
+                                 daemon=True)
+            t.start()
+            threads.append(t)
+        active_indices = list(range(len(urls)))
 
     time.sleep(probe_seconds)
 
@@ -580,6 +654,12 @@ def _do_download_parallel(context, urls, md5, download_dir, book_title="", autho
 
     size_report = ", ".join(f"#{i}={s // 1024}KB" for i, s in enumerate(sizes))
     log.info(f"  probe: [{size_report}] -> winner #{best_idx} @ {speed_kb:.1f} KB/s")
+
+    # Record health stats for each server based on probe outcome.
+    for i, url in enumerate(urls):
+        if results[i].get("status") == "skipped":
+            continue
+        _record_server(url, sizes[i], success=(sizes[i] >= 10000))
 
     for i, ev in enumerate(cancel_events):
         if i != best_idx:
@@ -663,14 +743,141 @@ def _fix_extension(file_path):
     return new_path
 
 
+def _fix_mojibake(text):
+    """Try to recover text that was decoded with the wrong encoding.
+
+    Common case on Anna's Archive: Chinese titles encoded in GBK on the page,
+    but interpreted by the browser as Latin-1/cp1252, producing garbage chars
+    like `綯ѧ` or `¾­µç`. We try multiple (wrong, right) encoding pairs and
+    pick the result with the best "text quality" score.
+    """
+    if not text:
+        return text
+
+    pairs = [
+        ("cp1252", "gbk"),
+        ("latin-1", "gbk"),
+        ("cp1252", "gb2312"),
+        ("latin-1", "gb2312"),
+        ("cp1252", "utf-8"),
+        ("latin-1", "utf-8"),
+        ("cp1252", "big5"),
+    ]
+
+    best, best_score = text, _text_quality(text)
+    for wrong, right in pairs:
+        try:
+            recovered = text.encode(wrong).decode(right)
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            continue
+        score = _text_quality(recovered)
+        if score > best_score:
+            best, best_score = recovered, score
+    return best
+
+
+def _text_quality(text):
+    """Higher = better. Penalizes replacement chars and Latin-1 garbage,
+    rewards ASCII and (if present) CJK."""
+    if not text:
+        return -1
+    score = 0
+    for c in text:
+        cp = ord(c)
+        if c == "�":
+            score -= 10
+        elif 0x80 <= cp <= 0xFF:
+            score -= 3  # Latin-1 extended — usually garbage in titles
+        elif cp < 0x80:
+            score += 1  # ASCII
+        elif 0x4E00 <= cp <= 0x9FFF:
+            score += 2  # CJK Unified Ideographs
+        elif 0x3000 <= cp <= 0x303F or 0xFF00 <= cp <= 0xFFEF:
+            score += 1  # CJK punctuation / fullwidth
+    return score
+
+
+def _looks_garbled(text):
+    """Heuristic: does the text look like mojibake / encoding garbage?
+
+    Signals of garbling:
+      - Replacement chars (U+FFFD)
+      - Latin-1 extended chars (0x80-0xFF) - usually mojibake residue
+      - Cyrillic chars in a title that's otherwise ASCII/CJK - mixing 3 scripts
+        is almost always an encoding accident, not a real bilingual title
+      - High ratio of "unusual" chars to total length
+    """
+    if not text:
+        return True
+    garbage = 0
+    scripts_seen = set()
+    for c in text:
+        cp = ord(c)
+        if cp == 0xFFFD:
+            garbage += 2
+        elif 0x80 <= cp <= 0xFF:
+            garbage += 1
+        elif cp < 0x80:
+            scripts_seen.add("ascii")
+        elif 0x0400 <= cp <= 0x04FF:
+            garbage += 1
+            scripts_seen.add("cyrillic")
+        elif 0x4E00 <= cp <= 0x9FFF:
+            scripts_seen.add("cjk")
+        elif 0x3000 <= cp <= 0x303F or 0xFF00 <= cp <= 0xFFEF:
+            scripts_seen.add("cjk_punct")
+    # Multi-script mixing (ascii + cjk + cyrillic etc.) is a strong garble signal
+    main_scripts = {s for s in scripts_seen if s not in ("cjk_punct",)}
+    if len(main_scripts) >= 3:
+        return True
+    return garbage / len(text) > 0.05
+
+def _clean_book_title(title):
+    """Clean a book title; return cleaned string or None if unrecoverable."""
+    if not title:
+        return None
+    recovered = _fix_mojibake(title)
+    if not _looks_garbled(recovered):
+        return recovered.strip()
+    # Still garbled: fall back to ASCII-only skeleton, then normalize.
+    ascii_only = "".join(c for c in title if ord(c) < 0x80)
+    # Collapse whitespace, strip leading/trailing punctuation residue from mojibake
+    ascii_only = re.sub(r"\s+", " ", ascii_only).strip(" \t\n\r=-_.,:;")
+    # Drop empty parentheses like "()" or "(  )" left by dropped non-ASCII
+    ascii_only = re.sub(r"\(\s*\)", "", ascii_only)
+    # Strip whitespace before closing parens (leftover from dropped non-ASCII)
+    ascii_only = re.sub(r"\s+\)", ")", ascii_only)
+    # Strip again after removing empty parens
+    ascii_only = ascii_only.strip(" \t\n\r=-_.,:;")
+    if len(ascii_only) >= 5:
+        return ascii_only
+    return None
+
+
 def rename_to_title(download_dir, md5, book_title, author):
-    """Rename md5.ext to 'Book Title - Author.ext'."""
+    """Rename md5.ext to 'Book Title - Author.ext'.
+
+    If the title is mojibake / unrecoverable, falls back to author-only
+    or keeps the md5 name.
+    """
     download_dir = Path(download_dir)
     for ext in VALID_EXTS:
         src = download_dir / f"{md5}{ext}"
         if src.exists():
-            display = f"{book_title} - {author}".strip(" -") if author else book_title
-            safe_name = re.sub(r'[<>:"/\\|?*]', "_", display)
+            clean_title = _clean_book_title(book_title)
+            clean_author = _clean_book_title(author) if author else None
+
+            if clean_title and clean_author:
+                display = f"{clean_title} - {clean_author}"
+            elif clean_title:
+                display = clean_title
+            elif clean_author:
+                display = clean_author
+            else:
+                log.warning(f"  title/author garbled, keeping md5 name: {src.name}")
+                return src
+
+            safe_name = re.sub(r'[<>:"/\\|?*]', "_", display).strip(" .")
             dst = download_dir / f"{safe_name}{ext}"
             if dst.exists() and dst != src:
                 dst = download_dir / f"{safe_name}_{md5[:8]}{ext}"
