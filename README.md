@@ -82,16 +82,20 @@ anna-download --batch booklist.txt --prefer pdf --dir ./my_books
 ### 单本下载
 
 ```python
-from anna_downloader import connect_cdp, get_page, search_books, download_book
+from anna_downloader import connect_cdp, get_page, find_best_book, download_book
 from pathlib import Path
 
 pw, browser = connect_cdp()
 context = browser.contexts[0] if browser.contexts else browser.new_context()
 page = get_page(context)
 
-books = search_books(page, "Classical Mechanics Taylor", max_results=10)
+# find_best_book 做严格过滤（作者词 + 标题匹配），返回 list
+# 空 list 表示搜索无结果或无相关结果（即 Anna's Archive 未收录）
+books = find_best_book(page, "Classical Mechanics Taylor", n=1)
 if books:
     download_book(page, context, books[0], download_dir=Path("./downloads"))
+else:
+    print("Anna's Archive 未收录此书")
 
 browser.close()
 pw.stop()

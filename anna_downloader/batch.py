@@ -68,8 +68,8 @@ def filter_results(results, author_query, book_title):
         filtered.append(r)
 
     if not filtered:
-        log.warning(f"  no results after filter, using all")
-        return results
+        log.info(f"  filter: {len(results)} -> 0 (no relevant match)")
+        return []
 
     log.info(f"  filtered: {len(results)} -> {len(filtered)}")
     return filtered
@@ -143,6 +143,7 @@ class BatchDownloader:
         self.prefer_fmt = prefer_fmt
         self.report = []
         self.fail_queue = []
+        self.not_found = []
 
     def process_book(self, book):
         """Process a single book. Returns 'skip', 'ok', or 'fail'."""
@@ -168,10 +169,16 @@ class BatchDownloader:
         if not results:
             log.warning(f"  no results found")
             self.report.append(f"NOT FOUND: {label}")
-            self.fail_queue.append(book)
-            return "fail"
+            self.not_found.append(book)
+            return "not_found"
 
         filtered = filter_results(results, author, title)
+        if not filtered:
+            log.warning(f"  Anna's Archive 未收录此书 (search returned {len(results)} but none relevant)")
+            self.report.append(f"NOT INDEXED: {label}")
+            self.not_found.append(book)
+            return "not_found"
+
         best = pick_best(filtered)
         log.info(f"  MD5: {best['md5']}")
 
@@ -224,6 +231,10 @@ class BatchDownloader:
         log.info("DONE! Summary:")
         for line in self.report:
             log.info(f"  {line}")
+        if self.not_found:
+            log.info(f"Anna's Archive 未收录 ({len(self.not_found)}):")
+            for b in self.not_found:
+                log.info(f"  {b['author']} - {b['title']}")
         if self.fail_queue:
             log.info(f"Still failed ({len(self.fail_queue)}):")
             for b in self.fail_queue:
@@ -241,6 +252,10 @@ class BatchDownloader:
             f.write(f"{'=' * 60}\n")
             for line in self.report:
                 f.write(f"{line}\n")
+            if self.not_found:
+                f.write(f"\nAnna's Archive 未收录 ({len(self.not_found)}):\n")
+                for b in self.not_found:
+                    f.write(f"  {b['author']} - {b['title']}\n")
             if self.fail_queue:
                 f.write(f"\nFailed ({len(self.fail_queue)}):\n")
                 for b in self.fail_queue:

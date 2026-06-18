@@ -239,25 +239,29 @@ def _keyword_rank_detailed(books, query):
     return sorted(books, key=score, reverse=True)
 
 
-def find_best_book(page, query, max_results=30):
-    """Search and return the single best matching book.
+def find_best_book(page, query, max_results=30, n=1):
+    """Search and return the top-N best matching books.
 
     Uses detailed search + batch filter/pick logic:
       - excludes solutions manuals / instructor editions
       - requires author-word match + partial title match
       - sorts by: author_match > title_match > format > downloads > size
 
-    Returns book dict (md5, title, author, fmt, ...) or None.
+    Returns list of book dicts (md5, title, author, fmt, ...), possibly empty.
+    With n=1 (default), callers typically unwrap with `[0]` after checking length.
     """
     from .batch import filter_results, pick_best
 
     results = search_books_detailed(page, query, max_results=max_results)
     if not results:
-        return None
+        return []
 
     filtered = filter_results(results, author_query=query, book_title=query)
-    pool = filtered if filtered else results
-    return pick_best(pool)
+    if not filtered:
+        return []
+
+    pick_best(filtered)  # sorts in place
+    return filtered[:n]
 
 
 # ---------- DDoS-Guard ----------

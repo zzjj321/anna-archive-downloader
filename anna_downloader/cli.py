@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .chrome import launch_chrome, connect_cdp, get_page
-from .downloader import search_books, download_book
+from .downloader import search_books, download_book, find_best_book
 from .batch import BatchDownloader, parse_book_list
 
 logging.basicConfig(
@@ -71,13 +71,15 @@ Examples:
         download_dir = Path(args.dir)
 
         if args.query:
-            books = search_books(page, args.query, max_results=10)
-            if not books:
-                log.error("No results found")
+            best_books = find_best_book(page, args.query, max_results=30, n=args.count)
+            if not best_books:
+                log.error(f"Anna's Archive 未收录: {args.query}")
                 return
-            log.info(f"Found {len(books)} results")
-            for i, b in enumerate(books[:args.count], 1):
-                log.info(f"\n[{i}/{min(args.count, len(books))}] {b['title'][:70]}")
+            log.info(f"Matched {len(best_books)} book(s) (out of search results, irrelevant ones filtered)")
+            for i, b in enumerate(best_books, 1):
+                log.info(f"\n[{i}/{len(best_books)}] {b['title'][:70]} | "
+                         f"{b.get('author','')[:30]} | {b.get('fmt','?').upper()} "
+                         f"{b.get('size_mb',0):.1f}MB")
                 download_book(page, context, b, download_dir=download_dir)
 
         elif args.batch:
