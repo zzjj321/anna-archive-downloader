@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -19,12 +20,12 @@ log = logging.getLogger("anna_downloader")
 BASE_URL = "https://annas-archive.pk"
 VALID_EXTS = {".pdf", ".djvu", ".epub", ".mobi", ".zip", ".rar"}
 
-# JS injection for slow-channel countdown bypass
+# JS injection for slow-channel countdown bypass.
+# All slow channels run their countdowns in parallel (no queueing) so we can
+# collect multiple direct URLs and race them in Python.
 INJECT_JS = r"""
 (function() {
   'use strict';
-  let isCountdownRunning = false;
-  const pendingRequests = [];
   function getScidbDirectUrl(url) {
     try {
       const parsed = new URL(url);
@@ -35,7 +36,7 @@ INJECT_JS = r"""
     } catch(e) {}
     return null;
   }
-  function fetchStatus(url, container, canLeadCountdown) {
+  function fetchStatus(url, container) {
     if (container.getAttribute('data-status') === 'done') return;
     const scidbUrl = getScidbDirectUrl(url);
     if (scidbUrl) {
@@ -56,24 +57,17 @@ INJECT_JS = r"""
       const cd = doc.querySelector('.js-partner-countdown');
       if (cd) {
         let s = parseInt(cd.innerText);
-        if (!isCountdownRunning && canLeadCountdown) {
-          isCountdownRunning = true;
-          container.setAttribute('data-status', 'waiting');
-          const iv = setInterval(() => {
-            if (s <= 0) {
-              clearInterval(iv);
-              container.innerHTML = ' [Preparing...]';
-              fetchStatus(url, container, true);
-              setTimeout(() => { isCountdownRunning = false; while(pendingRequests.length){ const r=pendingRequests.shift(); fetchStatus(r.url,r.container,true); } }, 1500);
-              return;
-            }
-            container.innerHTML = ` [Wait: ${s}s]`;
-            s--;
-          }, 1000);
-        } else {
-          container.innerHTML = ' [Queued]';
-          pendingRequests.push({url, container});
-        }
+        container.setAttribute('data-status', 'waiting');
+        const iv = setInterval(() => {
+          if (s <= 0) {
+            clearInterval(iv);
+            container.innerHTML = ' [Preparing...]';
+            fetchStatus(url, container);
+            return;
+          }
+          container.innerHTML = ` [Wait: ${s}s]`;
+          s--;
+        }, 1000);
       } else {
         container.innerHTML = ' [Need manual verify]';
       }
@@ -96,7 +90,7 @@ INJECT_JS = r"""
         container.innerHTML = ' [Checking...]';
         link.parentNode.insertBefore(container, link.nextSibling);
       }
-      setTimeout(() => fetchStatus(link.href, container, index === 0), index * 200);
+      setTimeout(() => fetchStatus(link.href, container), index * 200);
     });
   }
   if (document.readyState === 'loading') {
@@ -334,9 +328,11 @@ def download_book(page, context, book, download_dir=None):
         return False
 
     log.info("  waiting for slow channel...")
-    direct_url = None
+    direct_urls = []
+    max_servers = 4
+    poll_timeout = 60
 
-    for i in range(40):
+    for i in range(poll_timeout // 2):
         time.sleep(2)
         elapsed = (i + 1) * 2
 
@@ -345,9 +341,19 @@ def download_book(page, context, book, download_dir=None):
                 const links = document.querySelectorAll('span.direct-link-container a[style*="color:#28a745"]');
                 return Array.from(links).map(a => a.getAttribute('href')).filter(h => h && h.startsWith('http'));
             }""")
-            if get_urls:
-                direct_url = get_urls[0]
-                log.info(f"  got link! ({elapsed}s)")
+            # dedupe preserving order
+            seen = set()
+            direct_urls = []
+            for u in get_urls:
+                if u not in seen:
+                    seen.add(u)
+                    direct_urls.append(u)
+            if len(direct_urls) >= max_servers:
+                log.info(f"  got {len(direct_urls)} links ({elapsed}s)")
+                break
+            elif direct_urls and elapsed >= 20:
+                # after 20s, accept whatever we have (most countdowns finish by then)
+                log.info(f"  got {len(direct_urls)} link(s) ({elapsed}s)")
                 break
         except Exception:
             pass
@@ -357,19 +363,21 @@ def download_book(page, context, book, download_dir=None):
                 statuses = page.evaluate("""() => {
                     return Array.from(document.querySelectorAll('span.direct-link-container')).map(c => c.innerText.trim());
                 }""")
-                log.info(f"  [{elapsed}s] {statuses[:4]}")
+                log.info(f"  [{elapsed}s] {statuses[:max_servers]}")
             except Exception:
                 pass
 
-        if elapsed >= 60:
+        if elapsed >= poll_timeout:
             break
 
-    if not direct_url:
+    if not direct_urls:
         log.error("  no download link obtained")
         return False
 
     author = book.get("author", "")
-    return _do_download(context, direct_url, md5, download_dir, title, author)
+    if len(direct_urls) == 1:
+        return _do_download(context, direct_urls[0], md5, download_dir, title, author)
+    return _do_download_parallel(context, direct_urls, md5, download_dir, title, author)
 
 
 def _do_download(context, direct_url, md5, download_dir, book_title="", author=""):
@@ -480,6 +488,137 @@ def _do_download(context, direct_url, md5, download_dir, book_title="", author="
             time.sleep(wait)
 
     return False
+
+
+# ---------- Parallel / race download ----------
+
+PROBE_SECONDS = 5
+
+
+def _do_download_parallel(context, urls, md5, download_dir, book_title="", author="",
+                          probe_seconds=PROBE_SECONDS):
+    """Race downloads across multiple servers; keep the fastest.
+
+    Flow:
+      1. Start one thread per URL, each writing to its own temp file.
+      2. After probe_seconds, compare bytes downloaded.
+      3. Cancel losers, let the winner finish.
+      4. If the winner already completed during the probe, use its file directly;
+         otherwise resume via _do_download.
+    """
+    log.info(f"  racing {len(urls)} servers ({probe_seconds}s probe)...")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Referer": f"{BASE_URL}/",
+    }
+    cookies = [(c["name"], c["value"], c.get("domain", "")) for c in context.cookies()]
+
+    tmp_paths = [download_dir / f"{md5}.part{i}" for i in range(len(urls))]
+    cancel_events = [threading.Event() for _ in urls]
+    results = [{} for _ in urls]
+
+    def _make_session():
+        s = requests.Session()
+        s.verify = False
+        s.trust_env = False
+        for name, value, domain in cookies:
+            s.cookies.set(name, value, domain=domain)
+        s.headers.update(headers)
+        return s
+
+    def worker(idx, url, tmp_path, cancel_event, result_holder):
+        session = _make_session()
+        size = 0
+        try:
+            resp = session.get(url, timeout=(30, 900), stream=True)
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(65536):
+                    if cancel_event.is_set():
+                        resp.close()
+                        result_holder["status"] = "cancelled"
+                        result_holder["size"] = size
+                        return
+                    if chunk:
+                        f.write(chunk)
+                        size += len(chunk)
+            result_holder["status"] = "done"
+            result_holder["size"] = size
+        except Exception as e:
+            result_holder["status"] = "error"
+            result_holder["error"] = str(e)
+            result_holder["size"] = size
+
+    threads = []
+    for i, url in enumerate(urls):
+        t = threading.Thread(target=worker,
+                             args=(i, url, tmp_paths[i], cancel_events[i], results[i]),
+                             daemon=True)
+        t.start()
+        threads.append(t)
+
+    time.sleep(probe_seconds)
+
+    sizes = []
+    for path in tmp_paths:
+        try:
+            sizes.append(path.stat().st_size)
+        except Exception:
+            sizes.append(0)
+
+    best_idx = max(range(len(sizes)), key=lambda i: sizes[i])
+    best_size = sizes[best_idx]
+    speed_kb = best_size / probe_seconds / 1024 if probe_seconds > 0 else 0
+
+    size_report = ", ".join(f"#{i}={s // 1024}KB" for i, s in enumerate(sizes))
+    log.info(f"  probe: [{size_report}] -> winner #{best_idx} @ {speed_kb:.1f} KB/s")
+
+    for i, ev in enumerate(cancel_events):
+        if i != best_idx:
+            ev.set()
+
+    threads[best_idx].join()
+
+    for i, path in enumerate(tmp_paths):
+        if i != best_idx:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    winner_path = tmp_paths[best_idx]
+    winner_status = results[best_idx].get("status", "error")
+    winner_size = winner_path.stat().st_size if winner_path.exists() else 0
+
+    if winner_status == "error" or winner_size < 10000:
+        log.error(f"  race winner failed: {results[best_idx]}")
+        winner_path.unlink(missing_ok=True)
+        return False
+
+    if winner_status == "done":
+        file_path = _fix_extension(winner_path)
+        if book_title:
+            renamed = rename_to_title(download_dir, md5, book_title, author)
+            if renamed:
+                file_path = renamed
+        size_mb = winner_size / (1024 * 1024)
+        log.info(f"  [OK] {file_path.name} ({size_mb:.1f} MB, race)")
+        return True
+
+    # Winner was cancelled mid-download. Move partial to the canonical
+    # md5.pdf path so _do_download can resume via Range header.
+    canonical = download_dir / f"{md5}.pdf"
+    if winner_path != canonical:
+        if canonical.exists():
+            canonical.unlink()
+        winner_path.rename(canonical)
+
+    log.info(f"  resuming from winner #{best_idx} ({winner_size / (1024*1024):.1f} MB)")
+    return _do_download(context, urls[best_idx], md5, download_dir, book_title, author)
 
 
 def _fix_extension(file_path):
